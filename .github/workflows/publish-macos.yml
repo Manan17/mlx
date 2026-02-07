@@ -1,4 +1,4 @@
-name: Build and Publish mlx-unsloth (macOS)
+name: Build and Publish mlx-cce (macOS)
 
 on:
   push:
@@ -38,14 +38,14 @@ jobs:
           python -m pip install --upgrade pip
           pip install build setuptools cmake typing_extensions
 
-      - name: Build Stage 1 - Python package (mlx-unsloth)
+      - name: Build Stage 1 - Python package (mlx-cce)
         run: |
           python setup.py clean --all || true
           MLX_BUILD_STAGE=1 python -m build --wheel
           mkdir -p wheelhouse
           mv dist/*.whl wheelhouse/
 
-      - name: Build Stage 2 - Metal backend (mlx-unsloth-metal)
+      - name: Build Stage 2 - Metal backend (mlx-cce-metal)
         if: matrix.python-version == '3.10'  # Only need one Python version for backend
         run: |
           python setup.py clean --all || true
@@ -59,7 +59,7 @@ jobs:
           path: wheelhouse/*.whl
           if-no-files-found: error
 
-  publish_mlx_unsloth:
+  publish_mlx_cce:
     if: ${{ !inputs.dry_run }}
     needs: build_macos
     runs-on: ubuntu-latest
@@ -67,7 +67,7 @@ jobs:
       id-token: write
     environment:
       name: pypi
-      url: https://pypi.org/p/mlx-unsloth
+      url: https://pypi.org/p/mlx-cce
     steps:
       - name: Download all wheel artifacts
         uses: actions/download-artifact@v4
@@ -76,18 +76,18 @@ jobs:
           merge-multiple: true
           path: dist
 
-      - name: Filter mlx-unsloth wheels only
+      - name: Filter mlx-cce wheels only
         run: |
           mkdir -p upload
-          mv dist/mlx_unsloth-*.whl upload/ || true
+          mv dist/mlx_cce-*.whl upload/ || true
           ls -la upload/
 
-      - name: Publish mlx-unsloth to PyPI
+      - name: Publish mlx-cce to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: upload/
 
-  publish_mlx_unsloth_metal:
+  publish_mlx_cce_metal:
     if: ${{ !inputs.dry_run }}
     needs: build_macos
     runs-on: ubuntu-latest
@@ -95,7 +95,7 @@ jobs:
       id-token: write
     environment:
       name: pypi
-      url: https://pypi.org/p/mlx-unsloth-metal
+      url: https://pypi.org/p/mlx-cce-metal
     steps:
       - name: Download all wheel artifacts
         uses: actions/download-artifact@v4
@@ -104,13 +104,13 @@ jobs:
           merge-multiple: true
           path: dist
 
-      - name: Filter mlx-unsloth-metal wheels only
+      - name: Filter mlx-cce-metal wheels only
         run: |
           mkdir -p upload
-          mv dist/mlx_unsloth_metal-*.whl upload/ || true
+          mv dist/mlx_cce_metal-*.whl upload/ || true
           ls -la upload/
 
-      - name: Publish mlx-unsloth-metal to PyPI
+      - name: Publish mlx-cce-metal to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: upload/

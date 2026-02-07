@@ -263,17 +263,17 @@ if __name__ == "__main__":
     if build_stage != 2:
         if build_stage == 1:
             install_requires.append(
-                f'mlx-unsloth-metal=={version}; platform_system == "Darwin"'
+                f'mlx-cce-metal=={version}; platform_system == "Darwin"'
             )
-            extras["cuda"] = [f'mlx-unsloth-cuda-12=={version}; platform_system == "Linux"']
+            extras["cuda"] = [f'mlx-cce-cuda-12=={version}; platform_system == "Linux"']
             for toolkit in [12, 13]:
                 extras[f"cuda{toolkit}"] = [
-                    f'mlx-unsloth-cuda-{toolkit}=={version}; platform_system == "Linux"'
+                    f'mlx-cce-cuda-{toolkit}=={version}; platform_system == "Linux"'
                 ]
-            extras["cpu"] = [f'mlx-unsloth-cpu=={version}; platform_system == "Linux"']
+            extras["cpu"] = [f'mlx-cce-cpu=={version}; platform_system == "Linux"']
 
         _setup(
-            name="mlx-unsloth",
+            name="mlx-cce",
             packages=packages,
             extras_require=extras,
             entry_points=entry_points,
@@ -282,10 +282,10 @@ if __name__ == "__main__":
         )
     else:
         if build_macos:
-            name = "mlx-unsloth-metal"
+            name = "mlx-cce-metal"
         elif build_cuda:
             toolkit = cuda_toolkit_major_version()
-            name = f"mlx-unsloth-cuda-{toolkit}"
+            name = f"mlx-cce-cuda-{toolkit}"
             # Note: update following files when new dependency is added:
             # * .github/actions/build-cuda-release/action.yml
             # * mlx/backend/cuda/CMakeLists.txt
@@ -307,7 +307,7 @@ if __name__ == "__main__":
             ]
 
         else:
-            name = "mlx-unsloth-cpu"
+            name = "mlx-cce-cpu"
         _setup(
             name=name,
             packages=["mlx"],
