@@ -207,13 +207,13 @@ if __name__ == "__main__":
     _setup = partial(
         setup,
         version=version,
-        author="MLX Contributors",
-        author_email="mlx@group.apple.com",
-        description="A framework for machine learning on Apple silicon.",
+        author="Unsloth AI & MLX Contributors",
+        author_email="info@unsloth.ai",
+        description="MLX with CCE (Chunked Cross-Entropy) for memory-efficient training on Apple Silicon.",
         long_description=long_description,
         long_description_content_type="text/markdown",
         license="MIT",
-        url="https://github.com/ml-explore/mlx",
+        url="https://github.com/unslothai/mlx",
         include_package_data=True,
         package_dir=package_dir,
         zip_safe=False,
@@ -263,17 +263,17 @@ if __name__ == "__main__":
     if build_stage != 2:
         if build_stage == 1:
             install_requires.append(
-                f'mlx-metal=={version}; platform_system == "Darwin"'
+                f'mlx-unsloth-metal=={version}; platform_system == "Darwin"'
             )
-            extras["cuda"] = [f'mlx-cuda-12=={version}; platform_system == "Linux"']
+            extras["cuda"] = [f'mlx-unsloth-cuda-12=={version}; platform_system == "Linux"']
             for toolkit in [12, 13]:
                 extras[f"cuda{toolkit}"] = [
-                    f'mlx-cuda-{toolkit}=={version}; platform_system == "Linux"'
+                    f'mlx-unsloth-cuda-{toolkit}=={version}; platform_system == "Linux"'
                 ]
-            extras["cpu"] = [f'mlx-cpu=={version}; platform_system == "Linux"']
+            extras["cpu"] = [f'mlx-unsloth-cpu=={version}; platform_system == "Linux"']
 
         _setup(
-            name="mlx",
+            name="mlx-unsloth",
             packages=packages,
             extras_require=extras,
             entry_points=entry_points,
@@ -282,10 +282,10 @@ if __name__ == "__main__":
         )
     else:
         if build_macos:
-            name = "mlx-metal"
+            name = "mlx-unsloth-metal"
         elif build_cuda:
             toolkit = cuda_toolkit_major_version()
-            name = f"mlx-cuda-{toolkit}"
+            name = f"mlx-unsloth-cuda-{toolkit}"
             # Note: update following files when new dependency is added:
             # * .github/actions/build-cuda-release/action.yml
             # * mlx/backend/cuda/CMakeLists.txt
@@ -307,7 +307,7 @@ if __name__ == "__main__":
             ]
 
         else:
-            name = "mlx-cpu"
+            name = "mlx-unsloth-cpu"
         _setup(
             name=name,
             packages=["mlx"],

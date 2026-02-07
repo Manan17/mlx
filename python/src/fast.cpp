@@ -624,4 +624,40 @@ void init_fast(nb::module_& parent_module) {
            before the kernel runs. Default: ``False``.
         stream (mx.stream, optional): Stream to run the kernel on. Default: ``None``.
       )pbdoc");
+
+  m.def(
+      "cce_loss",
+      &mx::fast::cce_loss,
+      "hidden"_a,
+      "weight"_a,
+      "targets"_a,
+      "ignore_index"_a = -100,
+      "logit_softcap"_a = 0.0f,
+      "stream"_a = nb::none(),
+      R"pbdoc(
+      Chunked Cross-Entropy Loss.
+
+      Computes cross-entropy loss in a memory-efficient manner by processing
+      the vocabulary in chunks. This fuses the hidden @ weight matmul with
+      loss computation, avoiding materialization of the full [N, V] logits tensor.
+
+      Args:
+        hidden (array): Hidden states with shape ``[N, H]`` or ``[B, S, H]``
+        weight (array): LM head weight with shape ``[V, H]``
+        targets (array): Target indices with shape ``[N]`` or ``[B, S]``
+        ignore_index (int): Index to ignore in loss computation. Default: ``-100``
+        logit_softcap (float): Softcap for logits (0.0 = disabled). Default: ``0.0``
+        stream (mx.stream, optional): Stream to run on. Default: ``None``
+
+      Returns:
+        array: Per-token loss values with shape ``[N]`` or ``[B*S]``
+
+      Example:
+        >>> import mlx.core as mx
+        >>> hidden = mx.random.normal(shape=(4, 512))  # [batch, hidden_dim]
+        >>> weight = mx.random.normal(shape=(32000, 512))  # [vocab, hidden_dim]
+        >>> targets = mx.array([100, 200, 300, 400])
+        >>> loss = mx.fast.cce_loss(hidden, weight, targets)
+        >>> mean_loss = mx.mean(loss)
+      )pbdoc");
 }
