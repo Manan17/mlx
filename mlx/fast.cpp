@@ -938,4 +938,273 @@ bool ConvertFP8::is_equivalent(const Primitive& other) const {
   return to_fp8_ == a_other.to_fp8_;
 }
 
+// =============================================================================
+// CCE (Cut Cross-Entropy) Implementation
+// Memory-efficient cross-entropy with vocabulary tiling and sparsity
+// =============================================================================
+
+array cce_loss(
+    const array& hidden,
+    const array& weight,
+    const array& targets,
+    int ignore_index /* = -100 */,
+    float logit_softcap /* = 0.0f */,
+    StreamOrDevice s_ /* = {} */) {
+  // Validate inputs
+  if (hidden.ndim() < 2) {
+    std::ostringstream msg;
+    msg << "[cce_loss] hidden must have at least 2 dimensions but got "
+        << hidden.ndim() << " dimensions.";
+    throw std::invalid_argument(msg.str());
+  }
+  if (weight.ndim() != 2) {
+    std::ostringstream msg;
+    msg << "[cce_loss] weight must have 2 dimensions but got " << weight.ndim()
+        << " dimensions.";
+    throw std::invalid_argument(msg.str());
+  }
+  if (targets.ndim() < 1) {
+    std::ostringstream msg;
+    msg << "[cce_loss] targets must have at least 1 dimension but got "
+        << targets.ndim() << " dimensions.";
+    throw std::invalid_argument(msg.str());
+  }
+
+  // Check dtype compatibility
+  auto compute_type = result_type(hidden, weight);
+  if (!issubdtype(compute_type, floating)) {
+    std::ostringstream msg;
+    msg << "[cce_loss] Received unsupported type " << compute_type << ".";
+    throw std::invalid_argument(msg.str());
+  }
+  if (!issubdtype(targets.dtype(), integer)) {
+    std::ostringstream msg;
+    msg << "[cce_loss] targets must be integer type but got "
+        << targets.dtype() << ".";
+    throw std::invalid_argument(msg.str());
+  }
+
+  // Flatten batch dimensions: [B, T, H] -> [N, H]
+  int H = hidden.shape(-1);
+  int V = weight.shape(0);
+  int N = hidden.size() / H;
+
+  if (weight.shape(1) != H) {
+    std::ostringstream msg;
+    msg << "[cce_loss] hidden dim (" << H << ") must match weight dim ("
+        << weight.shape(1) << ").";
+    throw std::invalid_argument(msg.str());
+  }
+  if (targets.size() != N) {
+    std::ostringstream msg;
+    msg << "[cce_loss] targets size (" << targets.size()
+        << ") must match N (" << N << ").";
+    throw std::invalid_argument(msg.str());
+  }
+
+  auto s = to_stream(s_);
+
+  // Fallback implementation using standard MLX ops (for CPU)
+  // Uses online logsumexp for memory efficiency
+  auto fallback = [ignore_index, logit_softcap, H, V, N, compute_type, s](
+                      const std::vector<array>& inputs) {
+    auto h = reshape(inputs[0], {N, H}, s);
+    auto w = inputs[1];
+    auto t = reshape(inputs[2], {N}, s);
+    t = astype(t, int32, s);
+
+    auto valid_mask = not_equal(t, array(ignore_index, int32), s);
+
+    // Compute full logits and use standard cross-entropy for fallback
+    // This is not memory efficient but correct
+    auto logits = matmul(astype(h, compute_type, s),
+                         transpose(astype(w, compute_type, s), s), s);
+    logits = astype(logits, float32, s);
+
+    // Apply logit softcapping if enabled (Gemma-2 style models)
+    if (logit_softcap > 0.0f) {
+      logits = multiply(tanh(divide(logits, array(logit_softcap, float32), s), s),
+                        array(logit_softcap, float32), s);
+    }
+
+    // Compute logsumexp
+    auto lse = logsumexp(logits, -1, false, s);
+
+    // Gather target logits
+    auto target_logits = take_along_axis(
+        logits, expand_dims(t, -1, s), 1, s);
+    target_logits = squeeze(target_logits, -1, s);
+
+    // Per-token losses
+    auto token_losses = subtract(lse, target_logits, s);
+    token_losses = where(valid_mask, token_losses, zeros_like(token_losses, s), s);
+
+    return std::vector<array>{token_losses};
+  };
+
+  // Prepare inputs (flatten if needed)
+  auto h_flat = reshape(astype(hidden, compute_type, s), {N, H}, s);
+  auto w_typed = astype(weight, compute_type, s);
+  auto t_flat = reshape(astype(targets, int32, s), {N}, s);
+
+  // GPU path requires N >= 256 for correct gradients
+  // For smaller N, users should use the Python wrapper which falls back to baseline CE
+  constexpr int MIN_BATCH_FOR_GPU = 256;
+
+  if (!CCELoss::use_fallback(s) && N >= MIN_BATCH_FOR_GPU) {
+    // During training, output logsumexp for efficient backward pass
+    bool is_training = detail::in_grad_tracing();
+    bool output_logsumexp = is_training;
+
+    auto primitive = std::make_shared<CCELoss>(s, fallback, ignore_index, logit_softcap, output_logsumexp);
+
+    if (output_logsumexp) {
+      // Return both loss and logsumexp (logsumexp used in backward)
+      return array::make_arrays(
+          {{N}, {N}},
+          {float32, float32},
+          primitive,
+          {h_flat, w_typed, t_flat})[0];
+    } else {
+      return array(
+          {N},  // Output is per-token loss
+          float32,
+          primitive,
+          {h_flat, w_typed, t_flat});
+    }
+  }
+
+  // CPU fallback (for CPU stream or N < 256)
+  return fallback({h_flat, w_typed, t_flat})[0];
+}
+
+std::vector<array> CCELoss::vjp(
+    const std::vector<array>& primals,
+    const std::vector<array>& cotangents,
+    const std::vector<int>& argnums,
+    const std::vector<array>& outputs) {
+  assert(primals.size() == 3);
+  assert(cotangents.size() == outputs.size());
+
+  auto s = stream();
+  auto& hidden = primals[0];
+  auto& weight = primals[1];
+  auto& targets = primals[2];
+  auto& cotan = cotangents[0];
+
+  int H = hidden.shape(-1);
+  int V = weight.shape(0);
+  int N = hidden.size() / H;
+
+  // Check if we have logsumexp saved from forward
+  bool has_logsumexp = output_logsumexp_ && outputs.size() >= 2;
+
+  // Fallback VJP implementation (used when logsumexp not provided)
+  auto fallback = [ignore_index = ignore_index_, logit_softcap = logit_softcap_,
+                   has_logsumexp, H, V, N, s](const std::vector<array>& inputs) {
+    auto& h = inputs[0];
+    auto& w = inputs[1];
+    auto& t = inputs[2];
+    auto& cotan = inputs[3];
+    // inputs[4] is logsumexp if has_logsumexp is true
+
+    auto compute_type = h.dtype();
+
+    // Compute full logits for softmax (required for gradient computation)
+    auto logits = matmul(astype(h, compute_type, s),
+                         transpose(astype(w, compute_type, s), s), s);
+    logits = astype(logits, float32, s);
+
+    // Apply logit softcapping if enabled (Gemma-2 style models)
+    if (logit_softcap > 0.0f) {
+      logits = multiply(tanh(divide(logits, array(logit_softcap, float32), s), s),
+                        array(logit_softcap, float32), s);
+    }
+
+    // Use saved logsumexp if available, otherwise compute it
+    auto lse = (has_logsumexp && inputs.size() > 4)
+        ? expand_dims(inputs[4], -1, s)
+        : logsumexp(logits, -1, true, s);
+
+    // Compute softmax using saved/computed lse
+    auto softmax_probs = exp(subtract(logits, lse, s), s);
+
+    // Create one-hot for targets
+    auto one_hot = zeros({N, V}, float32, s);
+    // Scatter 1.0 at target positions
+    auto valid_mask = logical_and(
+        greater_equal(t, array(0, int32), s),
+        less(t, array(V, int32), s), s);
+    valid_mask = logical_and(
+        valid_mask,
+        not_equal(t, array(ignore_index, int32), s), s);
+
+    // For each valid target, subtract 1 from softmax
+    auto t_clamped = clip(t, array(0, int32), array(V - 1, int32), s);
+    auto row_idx = expand_dims(arange(N, int32, s), -1, s);  // [N, 1]
+    auto col_idx = expand_dims(t_clamped, -1, s);             // [N, 1]
+    auto updates = expand_dims(where(valid_mask, ones({N}, float32, s),
+                                     zeros({N}, float32, s), s), -1, s);  // [N, 1]
+    one_hot = scatter(one_hot, {row_idx, col_idx}, updates, {0, 1}, s);
+
+    // grad_logits = (softmax - one_hot) * upstream_grad
+    auto grad_logits = subtract(softmax_probs, one_hot, s);
+    grad_logits = multiply(grad_logits, expand_dims(cotan, -1, s), s);
+
+    // Apply ignore mask
+    auto ignore_mask = equal(t, array(ignore_index, int32), s);
+    grad_logits = where(
+        expand_dims(ignore_mask, -1, s),
+        zeros_like(grad_logits, s),
+        grad_logits, s);
+
+    // grad_hidden = grad_logits @ weight
+    auto grad_hidden = matmul(astype(grad_logits, compute_type, s),
+                              astype(w, compute_type, s), s);
+
+    // grad_weight = grad_logits.T @ hidden
+    auto grad_weight = matmul(transpose(astype(grad_logits, compute_type, s), s),
+                              astype(h, compute_type, s), s);
+
+    return std::vector<array>{grad_hidden, grad_weight};
+  };
+
+  // Build inputs for VJP primitive
+  std::vector<array> vjp_inputs = {primals[0], primals[1], primals[2], cotangents[0]};
+  if (has_logsumexp) {
+    vjp_inputs.push_back(outputs[1]);  // logsumexp from forward
+  }
+
+  auto vjps = array::make_arrays(
+      {primals[0].shape(), primals[1].shape()},
+      {primals[0].dtype(), primals[1].dtype()},
+      std::make_shared<CCELossVJP>(s, fallback, ignore_index_, logit_softcap_, has_logsumexp),
+      std::move(vjp_inputs));
+
+  std::vector<array> returned_vjps;
+  for (int arg : argnums) {
+    if (arg >= 2) {
+      // No gradient for targets
+      returned_vjps.push_back(zeros_like(primals[arg], s));
+    } else {
+      returned_vjps.push_back(std::move(vjps[arg]));
+    }
+  }
+  return returned_vjps;
+}
+
+bool CCELoss::is_equivalent(const Primitive& other) const {
+  const CCELoss& a_other = static_cast<const CCELoss&>(other);
+  return ignore_index_ == a_other.ignore_index_ &&
+         logit_softcap_ == a_other.logit_softcap_ &&
+         output_logsumexp_ == a_other.output_logsumexp_;
+}
+
+bool CCELossVJP::is_equivalent(const Primitive& other) const {
+  const CCELossVJP& a_other = static_cast<const CCELossVJP&>(other);
+  return ignore_index_ == a_other.ignore_index_ &&
+         logit_softcap_ == a_other.logit_softcap_ &&
+         has_logsumexp_ == a_other.has_logsumexp_;
+}
+
 } // namespace mlx::core::fast

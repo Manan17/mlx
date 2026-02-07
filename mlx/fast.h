@@ -100,4 +100,26 @@ MLX_API std::vector<array> precompiled_cuda_kernel(
     bool ensure_row_contiguous = false,
     StreamOrDevice s = {});
 
+/**
+ * Chunked Cross-Entropy Loss
+ *
+ * Computes cross-entropy loss in a memory-efficient manner by processing
+ * vocabulary in chunks. Fuses hidden @ weight matmul with loss computation.
+ *
+ * @param hidden Hidden states [N, H] or [B, S, H]
+ * @param weight LM head weight [V, H]
+ * @param targets Target indices [N] or [B, S]
+ * @param ignore_index Index to ignore in loss computation (default: -100)
+ * @param logit_softcap Softcap for logits (0.0 = disabled)
+ * @param s Stream or device
+ * @return Loss values [N] or [B, S]
+ */
+MLX_API array cce_loss(
+    const array& hidden,
+    const array& weight,
+    const array& targets,
+    int ignore_index = -100,
+    float logit_softcap = 0.0f,
+    StreamOrDevice s = {});
+
 } // namespace mlx::core::fast
