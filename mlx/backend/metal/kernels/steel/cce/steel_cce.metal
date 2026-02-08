@@ -1,4 +1,5 @@
-// Copyright © 2025 Apple Inc.
+// Copyright © 2025 Unsloth AI
+// Licensed under AGPL-3.0. See LICENSE.AGPL-3.0 file.
 
 #include <metal_stdlib>
 #include "mlx/backend/metal/kernels/bf16.h"

@@ -212,7 +212,7 @@ if __name__ == "__main__":
         description="MLX with CCE (Chunked Cross-Entropy) for memory-efficient training on Apple Silicon.",
         long_description=long_description,
         long_description_content_type="text/markdown",
-        license="MIT",
+        license="MIT AND AGPL-3.0",
         url="https://github.com/unslothai/mlx",
         include_package_data=True,
         package_dir=package_dir,

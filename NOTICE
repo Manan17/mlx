@@ -1,0 +1,14 @@
+MLX-CCE
+Copyright 2025 Unsloth AI
+
+This product includes software developed by Apple Inc. (MLX framework)
+licensed under the MIT License. See LICENSE file.
+
+CCE (Chunked Cross-Entropy) additions are licensed under AGPL-3.0.
+See LICENSE.AGPL-3.0 file.
+
+CCE files covered by AGPL-3.0:
+- mlx/backend/metal/cce.cpp
+- mlx/backend/metal/kernels/steel/cce/kernels.h
+- mlx/backend/metal/kernels/steel/cce/steel_cce.metal
+- docs/CCE.md

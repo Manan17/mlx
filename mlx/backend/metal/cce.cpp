@@ -1,4 +1,5 @@
-// Copyright © 2025 Apple Inc.
+// Copyright © 2025 Unsloth AI
+// Licensed under AGPL-3.0. See LICENSE.AGPL-3.0 file.
 
 #include "mlx/backend/gpu/copy.h"
 #include "mlx/backend/metal/device.h"
