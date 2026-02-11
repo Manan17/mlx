@@ -627,37 +627,104 @@ void init_fast(nb::module_& parent_module) {
 
   m.def(
       "cce_loss",
-      &mx::fast::cce_loss,
+      [](const mx::array& hidden,
+         const mx::array& weight,
+         const mx::array& targets,
+         const std::optional<mx::array>& scales,
+         const std::optional<mx::array>& biases,
+         int group_size,
+         int bits,
+         int ignore_index,
+         float logit_softcap,
+         mx::StreamOrDevice s) -> mx::array {
+        if (weight.dtype() == mx::uint32 && scales.has_value() && biases.has_value()) {
+          return mx::fast::cce_loss(
+              hidden, weight, *scales, *biases, targets,
+              group_size, bits, ignore_index, logit_softcap, s);
+        }
+        return mx::fast::cce_loss(
+            hidden, weight, targets, ignore_index, logit_softcap, s);
+      },
       "hidden"_a,
       "weight"_a,
       "targets"_a,
+      nb::kw_only(),
+      "scales"_a = nb::none(),
+      "biases"_a = nb::none(),
+      "group_size"_a = 64,
+      "bits"_a = 4,
       "ignore_index"_a = -100,
       "logit_softcap"_a = 0.0f,
       "stream"_a = nb::none(),
+      nb::sig(
+          "def cce_loss(hidden: array, weight: array, targets: array, *, scales: Optional[array] = None, biases: Optional[array] = None, group_size: int = 64, bits: int = 4, ignore_index: int = -100, logit_softcap: float = 0.0, stream: Union[None, Stream, Device] = None) -> array"),
       R"pbdoc(
-      Chunked Cross-Entropy Loss.
+        Cut Cross-Entropy (CCE) loss with optimized GPU implementation.
 
-      Computes cross-entropy loss in a memory-efficient manner by processing
-      the vocabulary in chunks. This fuses the hidden @ weight matmul with
-      loss computation, avoiding materialization of the full [N, V] logits tensor.
+        CCE computes cross entropy loss by tiling over the vocabulary dimension
+        instead of the token dimension, enabling memory-efficient computation
+        with online softmax and sparsity exploitation in the backward pass.
 
-      Args:
-        hidden (array): Hidden states with shape ``[N, H]`` or ``[B, S, H]``
-        weight (array): LM head weight with shape ``[V, H]``
-        targets (array): Target indices with shape ``[N]`` or ``[B, S]``
-        ignore_index (int): Index to ignore in loss computation. Default: ``-100``
-        logit_softcap (float): Softcap for logits (0.0 = disabled). Default: ``0.0``
-        stream (mx.stream, optional): Stream to run on. Default: ``None``
+        This is more memory-efficient than standard cross entropy for large
+        vocabulary models as it never materializes the full ``[N, V]`` logits tensor.
 
-      Returns:
-        array: Per-token loss values with shape ``[N]`` or ``[B*S]``
+        The computation is equivalent to::
 
-      Example:
-        >>> import mlx.core as mx
-        >>> hidden = mx.random.normal(shape=(4, 512))  # [batch, hidden_dim]
-        >>> weight = mx.random.normal(shape=(32000, 512))  # [vocab, hidden_dim]
-        >>> targets = mx.array([100, 200, 300, 400])
-        >>> loss = mx.fast.cce_loss(hidden, weight, targets)
-        >>> mean_loss = mx.mean(loss)
+            logits = hidden @ weight.T
+            if logit_softcap > 0:
+                logits = logit_softcap * tanh(logits / logit_softcap)
+            loss = cross_entropy(logits, targets, ignore_index=ignore_index)
+
+        But uses O(N * vocab_tile_size) memory instead of O(N * V).
+
+        Supports quantized weights: if ``weight`` is ``uint32`` (from ``mx.quantize``),
+        pass ``scales`` and ``biases`` to use fused quantized matmul kernels,
+        saving ~1.4GB for a 3B model (no dequantization or grad_weight needed).
+
+        Key optimizations:
+          * Vocabulary tiling with threadgroup memory for weight reuse
+          * Online logsumexp for numerical stability without storing all logits
+          * Sparsity exploitation in backward: skips ~99.98% of vocabulary
+            where softmax values are negligible
+          * Quantized path: fused dequantize-in-register matmul, no grad_weight
+
+        Args:
+            hidden (array): Input hidden states with shape ``[N, H]`` or ``[B, T, H]``
+                where N is the number of tokens, H is the hidden dimension.
+            weight (array): Language model head weight with shape ``[V, H]`` (dense)
+                or ``[V, H*bits/32]`` (quantized uint32 from ``mx.quantize``).
+            targets (array): Target indices with shape ``[N]`` or ``[B, T]``.
+                Values should be in ``[0, V)`` or equal to ``ignore_index``.
+            scales (array, optional): Quantization scales from ``mx.quantize``.
+                Required when ``weight`` is quantized (uint32). Default: ``None``.
+            biases (array, optional): Quantization biases from ``mx.quantize``.
+                Required when ``weight`` is quantized (uint32). Default: ``None``.
+            group_size (int): Quantization group size. Default: ``64``.
+            bits (int): Quantization bits. Default: ``4``.
+            ignore_index (int): Target index to ignore in loss computation.
+                Tokens with this target value do not contribute to the loss.
+                Default: ``-100``.
+            logit_softcap (float): If > 0, apply ``softcap * tanh(logits / softcap)``
+                before computing cross entropy. Used by Gemma-2 style models.
+                Default: ``0.0`` (disabled).
+
+        Returns:
+            array: Per-token loss values with shape matching ``targets``.
+
+        Example:
+
+          .. code-block:: python
+
+            import mlx.core as mx
+
+            # Dense weight
+            hidden = mx.random.normal(shape=(32, 256, 768))
+            weight = mx.random.normal(shape=(50000, 768))
+            targets = mx.random.randint(0, 50000, shape=(32, 256))
+            loss = mx.fast.cce_loss(hidden, weight, targets)
+
+            # Quantized weight (saves ~1.4GB for 3B models)
+            w_q, scales, biases = mx.quantize(weight, group_size=64, bits=4)
+            loss = mx.fast.cce_loss(hidden, w_q, targets, scales=scales, biases=biases)
       )pbdoc");
 }

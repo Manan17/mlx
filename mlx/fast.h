@@ -122,4 +122,17 @@ MLX_API array cce_loss(
     float logit_softcap = 0.0f,
     StreamOrDevice s = {});
 
+// Quantized overload: accepts pre-quantized weight (uint32) with scales/biases
+MLX_API array cce_loss(
+    const array& hidden,
+    const array& weight,
+    const array& scales,
+    const array& biases,
+    const array& targets,
+    int group_size = 64,
+    int bits = 4,
+    int ignore_index = -100,
+    float logit_softcap = 0.0f,
+    StreamOrDevice s = {});
+
 } // namespace mlx::core::fast

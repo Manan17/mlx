@@ -1,9 +1,10 @@
-// Copyright © 2025 Unsloth AI
-// Licensed under AGPL-3.0. See LICENSE.AGPL-3.0 file.
+// Copyright © 2025 Apple Inc.
 
 #include "mlx/backend/gpu/copy.h"
+#include "mlx/backend/metal/binary.h"
 #include "mlx/backend/metal/device.h"
 #include "mlx/backend/metal/matmul.h"
+#include "mlx/backend/metal/quantized.h"
 #include "mlx/backend/metal/utils.h"
 #include "mlx/fast_primitives.h"
 
@@ -43,66 +44,66 @@ inline int get_adaptive_chunk_v(int N, int V, int H) {
   return chunk_v;
 }
 
-inline std::tuple<int, int, int> get_cce_dims(const array& hidden, const array& weight) {
-  int N, H;
-  if (hidden.ndim() == 3) {
-    N = hidden.shape(0) * hidden.shape(1);
-    H = hidden.shape(2);
-  } else {
-    N = hidden.shape(0);
-    H = hidden.shape(1);
-  }
-  int V = weight.shape(0);
-  return {N, H, V};
-}
-
-inline const array& ensure_row_contiguous(
-    const array& arr,
-    const Stream& s,
-    std::vector<array>& copies) {
-  if (arr.flags().row_contiguous) {
-    return arr;
-  }
-  array arr_copy = contiguous_copy_gpu(arr, s);
-  copies.push_back(std::move(arr_copy));
-  return copies.back();
-}
-
-inline void dispatch_1d(
-    metal::CommandEncoder& encoder,
-    int num_elements,
-    int threads_per_tg = 256) {
-  int num_tgs = (num_elements + threads_per_tg - 1) / threads_per_tg;
-  MTL::Size grid_dims = MTL::Size(num_tgs, 1, 1);
-  MTL::Size group_dims = MTL::Size(threads_per_tg, 1, 1);
-  encoder.dispatch_threadgroups(grid_dims, group_dims);
-}
-
 void CCELoss::eval_gpu(
     const std::vector<array>& inputs,
     std::vector<array>& outputs) {
   auto& s = stream();
   auto& d = metal::device(s.device);
 
+  bool quantized = group_size() > 0;
+
   const array& hidden_in = inputs[0];
   const array& weight_in = inputs[1];
-  const array& targets_in = inputs[2];
+  // For quantized: inputs = [hidden, w_q, scales, biases, targets]
+  // For dense:     inputs = [hidden, weight, targets]
+  const array& targets_in = quantized ? inputs[4] : inputs[2];
 
-  auto [N, H, V] = get_cce_dims(hidden_in, weight_in);
+  int N, H, V;
+  if (hidden_in.ndim() == 3) {
+    N = hidden_in.shape(0) * hidden_in.shape(1);
+    H = hidden_in.shape(2);
+  } else {
+    N = hidden_in.shape(0);
+    H = hidden_in.shape(1);
+  }
+  V = weight_in.shape(0);
 
   std::vector<array> copies;
-  const array& h = ensure_row_contiguous(hidden_in, s, copies);
-  const array& w = ensure_row_contiguous(weight_in, s, copies);
-  const array& t = ensure_row_contiguous(targets_in, s, copies);
+  auto ensure_contiguous = [&copies, &s](const array& arr) -> const array& {
+    if (arr.flags().row_contiguous) {
+      return arr;
+    }
+    array arr_copy = contiguous_copy_gpu(arr, s);
+    copies.push_back(std::move(arr_copy));
+    return copies.back();
+  };
 
-  bool use_bf16_matmul = (h.dtype() == bfloat16 && w.dtype() == bfloat16);
-  bool use_fp16_matmul = (h.dtype() == float16 && w.dtype() == float16);
-  bool use_fp32_matmul = (h.dtype() == float32 && w.dtype() == float32);
+  const array& h = ensure_contiguous(hidden_in);
+  const array& w = ensure_contiguous(weight_in);
+  const array& t = ensure_contiguous(targets_in);
 
-  if (!use_bf16_matmul && !use_fp16_matmul && !use_fp32_matmul) {
-    throw std::invalid_argument(
-        "CCE requires matching input dtypes. Supported: both float32, both bfloat16, or both float16.");
+  // Quantized-specific arrays
+  const array* q_scales = nullptr;
+  const array* q_biases = nullptr;
+  if (quantized) {
+    q_scales = &ensure_contiguous(inputs[2]);
+    q_biases = &ensure_contiguous(inputs[3]);
   }
+
+  // For quantized, logits dtype comes from hidden; for dense, check matching types
+  if (!quantized) {
+    bool use_bf16_matmul = (h.dtype() == bfloat16 && w.dtype() == bfloat16);
+    bool use_fp16_matmul = (h.dtype() == float16 && w.dtype() == float16);
+    bool use_fp32_matmul = (h.dtype() == float32 && w.dtype() == float32);
+    if (!use_bf16_matmul && !use_fp16_matmul && !use_fp32_matmul) {
+      throw std::invalid_argument(
+          "CCE requires matching input dtypes. Supported: both float32, both bfloat16, or both float16.");
+    }
+  }
+  Dtype logits_dtype = h.dtype();
+
+  // For quantized, compute H from quantized weight shape
+  int H_eff = quantized ? (w.shape(1) * 32 / bits()) : H;
 
   array& loss = outputs[0];
   loss.set_data(allocator::malloc(loss.nbytes()));
@@ -117,11 +118,9 @@ void CCELoss::eval_gpu(
   auto& compute_encoder = d.get_command_encoder(s.index);
 
   {
-    int adaptive_chunk_v = get_adaptive_chunk_v(N, V, H);
+    int adaptive_chunk_v = get_adaptive_chunk_v(N, V, H_eff);
     int num_chunks = (V + adaptive_chunk_v - 1) / adaptive_chunk_v;
     int max_chunk_v = std::min(adaptive_chunk_v, V);
-
-    Dtype logits_dtype = use_bf16_matmul ? bfloat16 : (use_fp16_matmul ? float16 : float32);
 
     array logits_chunk({N, max_chunk_v}, logits_dtype, nullptr, {});
     logits_chunk.set_data(allocator::malloc(logits_chunk.nbytes()));
@@ -145,35 +144,72 @@ void CCELoss::eval_gpu(
       compute_encoder.set_output_array(running_sum_exp, 1);
       compute_encoder.set_output_array(target_logit, 2);
       compute_encoder.set_bytes(N, 3);
-      dispatch_1d(compute_encoder, N);
+
+      int threads_per_tg = 256;
+      int num_tgs = (N + threads_per_tg - 1) / threads_per_tg;
+      MTL::Size grid_dims = MTL::Size(num_tgs, 1, 1);
+      MTL::Size group_dims = MTL::Size(threads_per_tg, 1, 1);
+      compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
     }
 
     std::string lse_kernel_name = "cce_chunk_logsumexp_" + type_to_name(h.dtype());
     auto lse_kernel = d.get_kernel(lse_kernel_name);
+
+    // Quantized weight dimensions for slicing
+    int w_q_cols = quantized ? w.shape(1) : 0;           // packed columns
+    int s_cols = quantized ? q_scales->shape(1) : 0;     // scales columns
+    int b_cols = quantized ? q_biases->shape(1) : 0;     // biases columns
 
     for (int chunk_idx = 0; chunk_idx < num_chunks; chunk_idx++) {
       int v_start = chunk_idx * max_chunk_v;
       int v_end = std::min(v_start + max_chunk_v, V);
       int current_chunk_v = v_end - v_start;
 
-      array weight_chunk({current_chunk_v, H}, w.dtype(), nullptr, {});
-      int64_t w_offset = static_cast<int64_t>(v_start) * H;
-      weight_chunk.copy_shared_buffer(
-          w, {static_cast<int64_t>(H), 1}, w.flags(), static_cast<size_t>(current_chunk_v * H), w_offset);
-
       array logits_view({N, current_chunk_v}, logits_dtype, nullptr, {});
       logits_view.copy_shared_buffer(
           logits_chunk, {static_cast<int64_t>(current_chunk_v), 1}, logits_chunk.flags(),
           static_cast<size_t>(N * current_chunk_v), 0);
 
-      steel_matmul(
-          s, d,
-          h, weight_chunk, logits_view,
-          N, current_chunk_v, H,
-          1,
-          H, H,
-          false, true,
-          copies);
+      if (quantized) {
+        // Slice quantized weight, scales, biases for this chunk
+        array wq_chunk({current_chunk_v, w_q_cols}, w.dtype(), nullptr, {});
+        wq_chunk.copy_shared_buffer(
+            w, {static_cast<int64_t>(w_q_cols), 1}, w.flags(),
+            static_cast<size_t>(current_chunk_v * w_q_cols),
+            static_cast<int64_t>(v_start) * w_q_cols);
+
+        array sc_chunk({current_chunk_v, s_cols}, q_scales->dtype(), nullptr, {});
+        sc_chunk.copy_shared_buffer(
+            *q_scales, {static_cast<int64_t>(s_cols), 1}, q_scales->flags(),
+            static_cast<size_t>(current_chunk_v * s_cols),
+            static_cast<int64_t>(v_start) * s_cols);
+
+        array bi_chunk({current_chunk_v, b_cols}, q_biases->dtype(), nullptr, {});
+        bi_chunk.copy_shared_buffer(
+            *q_biases, {static_cast<int64_t>(b_cols), 1}, q_biases->flags(),
+            static_cast<size_t>(current_chunk_v * b_cols),
+            static_cast<int64_t>(v_start) * b_cols);
+
+        std::optional<array> bi_opt(bi_chunk);
+        dispatch_quantized_matmul(
+            h, wq_chunk, sc_chunk, bi_opt, logits_view,
+            true, group_size(), bits(),
+            N, current_chunk_v, H_eff, d, s);
+      } else {
+        array weight_chunk({current_chunk_v, H}, w.dtype(), nullptr, {});
+        int64_t w_offset = static_cast<int64_t>(v_start) * H;
+        weight_chunk.copy_shared_buffer(
+            w, {static_cast<int64_t>(H), 1}, w.flags(), static_cast<size_t>(current_chunk_v * H), w_offset);
+
+        steel_matmul(
+            s, d,
+            h, weight_chunk, logits_view,
+            N, current_chunk_v, H,
+            1,
+            H, H,
+            false, true,
+            copies);
+      }
 
       float softcap = logit_softcap();
       compute_encoder.set_compute_pipeline_state(lse_kernel);
@@ -211,7 +247,12 @@ void CCELoss::eval_gpu(
       compute_encoder.set_bytes(N, 6);
       compute_encoder.set_bytes(ignore_index_, 7);
       compute_encoder.set_bytes(scale, 8);
-      dispatch_1d(compute_encoder, N);
+
+      int threads_per_tg = 256;
+      int num_tgs = (N + threads_per_tg - 1) / threads_per_tg;
+      MTL::Size grid_dims = MTL::Size(num_tgs, 1, 1);
+      MTL::Size group_dims = MTL::Size(threads_per_tg, 1, 1);
+      compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
     } else {
       auto final_kernel = d.get_kernel("cce_finalize_loss");
       compute_encoder.set_compute_pipeline_state(final_kernel);
@@ -224,7 +265,12 @@ void CCELoss::eval_gpu(
       compute_encoder.set_bytes(N, 5);
       compute_encoder.set_bytes(ignore_index_, 6);
       compute_encoder.set_bytes(scale, 7);
-      dispatch_1d(compute_encoder, N);
+
+      int threads_per_tg = 256;
+      int num_tgs = (N + threads_per_tg - 1) / threads_per_tg;
+      MTL::Size grid_dims = MTL::Size(num_tgs, 1, 1);
+      MTL::Size group_dims = MTL::Size(threads_per_tg, 1, 1);
+      compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
     }
 
     d.add_temporary(logits_chunk, s.index);
@@ -240,29 +286,59 @@ void CCELossVJP::eval_gpu(
   auto& s = stream();
   auto& d = metal::device(s.device);
 
+  bool quantized = group_size() > 0;
+
   const array& hidden_in = inputs[0];
   const array& weight_in = inputs[1];
-  const array& targets_in = inputs[2];
-  const array& grad_output = inputs[3];
+  // Quantized inputs: [hidden, w_q, scales, biases, targets, cotan, (logsumexp)]
+  // Dense inputs:     [hidden, weight, targets, cotan, (logsumexp)]
+  const array& targets_in = quantized ? inputs[4] : inputs[2];
+  const array& grad_output = quantized ? inputs[5] : inputs[3];
 
-  auto [N, H, V] = get_cce_dims(hidden_in, weight_in);
+  int N, H, V;
+  if (hidden_in.ndim() == 3) {
+    N = hidden_in.shape(0) * hidden_in.shape(1);
+    H = hidden_in.shape(2);
+  } else {
+    N = hidden_in.shape(0);
+    H = hidden_in.shape(1);
+  }
+  V = weight_in.shape(0);
+  int H_eff = quantized ? (weight_in.shape(1) * 32 / bits()) : H;
 
   std::vector<array> copies;
-  const array& h = ensure_row_contiguous(hidden_in, s, copies);
-  const array& w = ensure_row_contiguous(weight_in, s, copies);
-  const array& t = ensure_row_contiguous(targets_in, s, copies);
-  const array& g_out_raw = ensure_row_contiguous(grad_output, s, copies);
+  auto ensure_contiguous = [&copies, &s](const array& arr) -> const array& {
+    if (arr.flags().row_contiguous) {
+      return arr;
+    }
+    array arr_copy = contiguous_copy_gpu(arr, s);
+    copies.push_back(std::move(arr_copy));
+    return copies.back();
+  };
 
-  bool use_bf16 = (h.dtype() == bfloat16 && w.dtype() == bfloat16);
-  bool use_fp16 = (h.dtype() == float16 && w.dtype() == float16);
-  bool use_fp32 = (h.dtype() == float32 && w.dtype() == float32);
+  const array& h = ensure_contiguous(hidden_in);
+  const array& w = ensure_contiguous(weight_in);
+  const array& t = ensure_contiguous(targets_in);
+  const array& g_out_raw = ensure_contiguous(grad_output);
 
-  if (!use_bf16 && !use_fp16 && !use_fp32) {
-    throw std::invalid_argument(
-        "CCE backward requires matching input dtypes. Supported: both float32, both bfloat16, or both float16.");
+  // Quantized-specific arrays
+  const array* q_scales = nullptr;
+  const array* q_biases = nullptr;
+  if (quantized) {
+    q_scales = &ensure_contiguous(inputs[2]);
+    q_biases = &ensure_contiguous(inputs[3]);
   }
 
-  Dtype compute_dtype = use_bf16 ? bfloat16 : (use_fp16 ? float16 : float32);
+  if (!quantized) {
+    bool use_bf16 = (h.dtype() == bfloat16 && w.dtype() == bfloat16);
+    bool use_fp16 = (h.dtype() == float16 && w.dtype() == float16);
+    bool use_fp32 = (h.dtype() == float32 && w.dtype() == float32);
+    if (!use_bf16 && !use_fp16 && !use_fp32) {
+      throw std::invalid_argument(
+          "CCE backward requires matching input dtypes. Supported: both float32, both bfloat16, or both float16.");
+    }
+  }
+  Dtype compute_dtype = h.dtype();
 
   array g_out_expanded({N}, float32, nullptr, {});
   g_out_expanded.set_data(allocator::malloc(g_out_expanded.nbytes()));
@@ -275,37 +351,43 @@ void CCELossVJP::eval_gpu(
   }
   const array& g_out = g_out_expanded;
 
+  // For quantized: only one output (grad_hidden). No grad_weight.
   array& grad_hidden = outputs[0];
-  array& grad_weight = outputs[1];
-
   grad_hidden.set_data(allocator::malloc(grad_hidden.nbytes()));
-  grad_weight.set_data(allocator::malloc(grad_weight.nbytes()));
 
-  if (use_bf16) {
-    array zero_val_bf16 = array(static_cast<float>(0.0f), bfloat16);
-    fill_gpu(zero_val_bf16, grad_weight, s);
-    copies.push_back(std::move(zero_val_bf16));
-  } else {
-    array zero_val_f32 = array(0.0f, float32);
-    fill_gpu(zero_val_f32, grad_weight, s);
-    copies.push_back(std::move(zero_val_f32));
+  if (!quantized) {
+    array& grad_weight = outputs[1];
+    grad_weight.set_data(allocator::malloc(grad_weight.nbytes()));
+
+    bool use_bf16 = (compute_dtype == bfloat16);
+    if (use_bf16) {
+      array zero_val_bf16 = array(static_cast<float>(0.0f), bfloat16);
+      fill_gpu(zero_val_bf16, grad_weight, s);
+      copies.push_back(std::move(zero_val_bf16));
+    } else {
+      array zero_val_f32 = array(0.0f, float32);
+      fill_gpu(zero_val_f32, grad_weight, s);
+      copies.push_back(std::move(zero_val_f32));
+    }
   }
 
   float scale = 1.0f;
   auto& compute_encoder = d.get_command_encoder(s.index);
 
   {
-    int adaptive_chunk_v = get_adaptive_chunk_v(N, V, H);
+    int adaptive_chunk_v = get_adaptive_chunk_v(N, V, H_eff);
     int num_chunks = (V + adaptive_chunk_v - 1) / adaptive_chunk_v;
     int max_chunk_v = std::min(adaptive_chunk_v, V);
 
-    bool use_saved_lse = has_logsumexp() && inputs.size() > 4;
+    // Determine logsumexp index based on quantized vs dense
+    int lse_input_idx = quantized ? 6 : 4;
+    bool use_saved_lse = has_logsumexp() && static_cast<int>(inputs.size()) > lse_input_idx;
     bool logsumexp_needs_temp = false;
 
     array logsumexp({N}, float32, nullptr, {});
 
     if (use_saved_lse) {
-      const array& saved_lse = inputs[4];
+      const array& saved_lse = inputs[lse_input_idx];
       logsumexp.set_data(allocator::malloc(logsumexp.nbytes()));
       copy_gpu(saved_lse, logsumexp, CopyType::General, s);
       logsumexp_needs_temp = true;
@@ -332,7 +414,12 @@ void CCELossVJP::eval_gpu(
         compute_encoder.set_output_array(running_sum_exp, 1);
         compute_encoder.set_output_array(logsumexp, 2);
         compute_encoder.set_bytes(N, 3);
-        dispatch_1d(compute_encoder, N);
+
+        int threads_per_tg = 256;
+        int num_tgs = (N + threads_per_tg - 1) / threads_per_tg;
+        MTL::Size grid_dims = MTL::Size(num_tgs, 1, 1);
+        MTL::Size group_dims = MTL::Size(threads_per_tg, 1, 1);
+        compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
       }
 
       std::string lse_kernel_name = "cce_chunk_logsumexp_" + type_to_name(h.dtype());
@@ -342,29 +429,60 @@ void CCELossVJP::eval_gpu(
       constexpr int LSE_NUM_SIMDGROUPS = LSE_THREADS_PER_TG / 32;
       size_t lse_smem_size = 2 * LSE_NUM_SIMDGROUPS * sizeof(float);
 
+      // Quantized weight dimensions for slicing
+      int w_q_cols = quantized ? w.shape(1) : 0;
+      int s_cols = quantized ? q_scales->shape(1) : 0;
+      int b_cols = quantized ? q_biases->shape(1) : 0;
+
       for (int chunk_idx = 0; chunk_idx < num_chunks; chunk_idx++) {
         int v_start = chunk_idx * max_chunk_v;
         int v_end = std::min(v_start + max_chunk_v, V);
         int current_chunk_v = v_end - v_start;
-
-        array weight_chunk({current_chunk_v, H}, w.dtype(), nullptr, {});
-        int64_t w_offset = static_cast<int64_t>(v_start) * H;
-        weight_chunk.copy_shared_buffer(
-            w, {static_cast<int64_t>(H), 1}, w.flags(), static_cast<size_t>(current_chunk_v * H), w_offset);
 
         array logits_view({N, current_chunk_v}, compute_dtype, nullptr, {});
         logits_view.copy_shared_buffer(
             lse_logits_chunk, {static_cast<int64_t>(current_chunk_v), 1}, lse_logits_chunk.flags(),
             static_cast<size_t>(N * current_chunk_v), 0);
 
-        steel_matmul(
-            s, d,
-            h, weight_chunk, logits_view,
-            N, current_chunk_v, H,
-            1,
-            H, H,
-            false, true,
-            copies);
+        if (quantized) {
+          array wq_chunk({current_chunk_v, w_q_cols}, w.dtype(), nullptr, {});
+          wq_chunk.copy_shared_buffer(
+              w, {static_cast<int64_t>(w_q_cols), 1}, w.flags(),
+              static_cast<size_t>(current_chunk_v * w_q_cols),
+              static_cast<int64_t>(v_start) * w_q_cols);
+
+          array sc_chunk({current_chunk_v, s_cols}, q_scales->dtype(), nullptr, {});
+          sc_chunk.copy_shared_buffer(
+              *q_scales, {static_cast<int64_t>(s_cols), 1}, q_scales->flags(),
+              static_cast<size_t>(current_chunk_v * s_cols),
+              static_cast<int64_t>(v_start) * s_cols);
+
+          array bi_chunk({current_chunk_v, b_cols}, q_biases->dtype(), nullptr, {});
+          bi_chunk.copy_shared_buffer(
+              *q_biases, {static_cast<int64_t>(b_cols), 1}, q_biases->flags(),
+              static_cast<size_t>(current_chunk_v * b_cols),
+              static_cast<int64_t>(v_start) * b_cols);
+
+          std::optional<array> bi_opt(bi_chunk);
+          dispatch_quantized_matmul(
+              h, wq_chunk, sc_chunk, bi_opt, logits_view,
+              true, group_size(), bits(),
+              N, current_chunk_v, H_eff, d, s);
+        } else {
+          array weight_chunk({current_chunk_v, H}, w.dtype(), nullptr, {});
+          int64_t w_offset = static_cast<int64_t>(v_start) * H;
+          weight_chunk.copy_shared_buffer(
+              w, {static_cast<int64_t>(H), 1}, w.flags(), static_cast<size_t>(current_chunk_v * H), w_offset);
+
+          steel_matmul(
+              s, d,
+              h, weight_chunk, logits_view,
+              N, current_chunk_v, H,
+              1,
+              H, H,
+              false, true,
+              copies);
+        }
 
         float softcap = logit_softcap();
         compute_encoder.set_compute_pipeline_state(lse_kernel);
@@ -393,7 +511,11 @@ void CCELossVJP::eval_gpu(
         compute_encoder.set_input_array(running_sum_exp, 1);
         compute_encoder.set_output_array(logsumexp, 2);
         compute_encoder.set_bytes(N, 3);
-        dispatch_1d(compute_encoder, N);
+
+        int num_tgs = (N + 255) / 256;
+        MTL::Size grid_dims = MTL::Size(num_tgs, 1, 1);
+        MTL::Size group_dims = MTL::Size(256, 1, 1);
+        compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
       }
 
       d.add_temporary(running_state_bwd, s.index);
@@ -403,6 +525,8 @@ void CCELossVJP::eval_gpu(
     array logits_chunk({N, max_chunk_v}, compute_dtype, nullptr, {});
     logits_chunk.set_data(allocator::malloc(logits_chunk.nbytes()));
 
+    bool use_bf16 = (compute_dtype == bfloat16);
+    bool use_fp16 = (compute_dtype == float16);
     const bool needs_separate_d_logits = (use_bf16 || use_fp16) && !metal::is_nax_available();
     array d_logits_chunk({N, max_chunk_v}, compute_dtype, nullptr, {});
     if (needs_separate_d_logits) {
@@ -412,88 +536,189 @@ void CCELossVJP::eval_gpu(
     std::string d_logits_kernel_name = "cce_compute_d_logits_" + type_to_name(h.dtype());
     auto d_logits_kernel = d.get_kernel(d_logits_kernel_name);
 
+    // Quantized weight dimensions for slicing (gradient loop)
+    int w_q_cols = quantized ? w.shape(1) : 0;
+    int s_cols = quantized ? q_scales->shape(1) : 0;
+    int b_cols = quantized ? q_biases->shape(1) : 0;
+
+    // For quantized backward, we need a temp buffer for qmm result
+    // before accumulating into grad_hidden
+    array qmm_temp({0}, compute_dtype, nullptr, {});
+    if (quantized) {
+      qmm_temp = array({N, H_eff}, compute_dtype, nullptr, {});
+      qmm_temp.set_data(allocator::malloc(qmm_temp.nbytes()));
+    }
+
     for (int chunk_idx = 0; chunk_idx < num_chunks; chunk_idx++) {
       int v_start = chunk_idx * max_chunk_v;
       int v_end = std::min(v_start + max_chunk_v, V);
       int current_chunk_v = v_end - v_start;
-
-      array weight_chunk({current_chunk_v, H}, w.dtype(), nullptr, {});
-      int64_t w_offset = static_cast<int64_t>(v_start) * H;
-      weight_chunk.copy_shared_buffer(
-          w, {static_cast<int64_t>(H), 1}, w.flags(), static_cast<size_t>(current_chunk_v * H), w_offset);
 
       array logits_view({N, current_chunk_v}, compute_dtype, nullptr, {});
       logits_view.copy_shared_buffer(
           logits_chunk, {static_cast<int64_t>(current_chunk_v), 1}, logits_chunk.flags(),
           static_cast<size_t>(N * current_chunk_v), 0);
 
-      steel_matmul(
-          s, d,
-          h, weight_chunk, logits_view,
-          N, current_chunk_v, H,
-          1,
-          H, H,
-          false, true,
-          copies);
+      if (quantized) {
+        // Recompute logits with qmm
+        array wq_chunk({current_chunk_v, w_q_cols}, w.dtype(), nullptr, {});
+        wq_chunk.copy_shared_buffer(
+            w, {static_cast<int64_t>(w_q_cols), 1}, w.flags(),
+            static_cast<size_t>(current_chunk_v * w_q_cols),
+            static_cast<int64_t>(v_start) * w_q_cols);
 
-      array d_logits_view({N, current_chunk_v}, compute_dtype, nullptr, {});
-      if (needs_separate_d_logits) {
-        d_logits_view.copy_shared_buffer(
-            d_logits_chunk, {static_cast<int64_t>(current_chunk_v), 1}, d_logits_chunk.flags(),
-            static_cast<size_t>(N * current_chunk_v), 0);
+        array sc_chunk({current_chunk_v, s_cols}, q_scales->dtype(), nullptr, {});
+        sc_chunk.copy_shared_buffer(
+            *q_scales, {static_cast<int64_t>(s_cols), 1}, q_scales->flags(),
+            static_cast<size_t>(current_chunk_v * s_cols),
+            static_cast<int64_t>(v_start) * s_cols);
+
+        array bi_chunk({current_chunk_v, b_cols}, q_biases->dtype(), nullptr, {});
+        bi_chunk.copy_shared_buffer(
+            *q_biases, {static_cast<int64_t>(b_cols), 1}, q_biases->flags(),
+            static_cast<size_t>(current_chunk_v * b_cols),
+            static_cast<int64_t>(v_start) * b_cols);
+
+        std::optional<array> bi_opt(bi_chunk);
+        dispatch_quantized_matmul(
+            h, wq_chunk, sc_chunk, bi_opt, logits_view,
+            true, group_size(), bits(),
+            N, current_chunk_v, H_eff, d, s);
+
+        // Compute d_logits
+        array d_logits_view({N, current_chunk_v}, compute_dtype, nullptr, {});
+        if (needs_separate_d_logits) {
+          d_logits_view.copy_shared_buffer(
+              d_logits_chunk, {static_cast<int64_t>(current_chunk_v), 1}, d_logits_chunk.flags(),
+              static_cast<size_t>(N * current_chunk_v), 0);
+        } else {
+          d_logits_view.copy_shared_buffer(
+              logits_chunk, {static_cast<int64_t>(current_chunk_v), 1}, logits_chunk.flags(),
+              static_cast<size_t>(N * current_chunk_v), 0);
+        }
+
+        float softcap_bwd = logit_softcap();
+        compute_encoder.set_compute_pipeline_state(d_logits_kernel);
+        compute_encoder.set_input_array(logits_view, 0);
+        compute_encoder.set_input_array(logsumexp, 1);
+        compute_encoder.set_input_array(t, 2);
+        compute_encoder.set_input_array(g_out, 3);
+        compute_encoder.set_output_array(d_logits_view, 4);
+        compute_encoder.set_bytes(N, 5);
+        compute_encoder.set_bytes(current_chunk_v, 6);
+        compute_encoder.set_bytes(v_start, 7);
+        compute_encoder.set_bytes(V, 8);
+        compute_encoder.set_bytes(scale, 9);
+        compute_encoder.set_bytes(softcap_bwd, 10);
+
+        constexpr int N_READS = 4;
+        int total_elements = N * current_chunk_v;
+        int total_threads = (total_elements + N_READS - 1) / N_READS;
+        int threads_per_tg = 256;
+        int num_tgs = (total_threads + threads_per_tg - 1) / threads_per_tg;
+        MTL::Size grid_dims = MTL::Size(num_tgs, 1, 1);
+        MTL::Size group_dims = MTL::Size(threads_per_tg, 1, 1);
+        compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
+
+        // grad_hidden += d_logits @ W_deq (via qmm with transpose=false)
+        // qmm: d_logits_view [N, current_chunk_v] @ W_q^T [current_chunk_v, H] -> [N, H]
+        // We need d_logits @ W (not transposed), so transpose=false for qmm
+        dispatch_quantized_matmul(
+            d_logits_view, wq_chunk, sc_chunk, bi_opt, qmm_temp,
+            false, group_size(), bits(),
+            N, H_eff, current_chunk_v, d, s);
+
+        // Accumulate: grad_hidden += qmm_temp
+        if (chunk_idx == 0) {
+          // First chunk: copy qmm_temp -> grad_hidden
+          copy_gpu(qmm_temp, grad_hidden, CopyType::General, s);
+        } else {
+          // Subsequent chunks: grad_hidden += qmm_temp
+          std::vector<array> add_inputs = {grad_hidden, qmm_temp};
+          binary_op_gpu_inplace(add_inputs, grad_hidden, "Add", s);
+        }
+
+        // Skip grad_weight for quantized
       } else {
-        d_logits_view.copy_shared_buffer(
-            logits_chunk, {static_cast<int64_t>(current_chunk_v), 1}, logits_chunk.flags(),
-            static_cast<size_t>(N * current_chunk_v), 0);
+        // Dense path (original behavior)
+        array weight_chunk({current_chunk_v, H}, w.dtype(), nullptr, {});
+        int64_t w_offset = static_cast<int64_t>(v_start) * H;
+        weight_chunk.copy_shared_buffer(
+            w, {static_cast<int64_t>(H), 1}, w.flags(), static_cast<size_t>(current_chunk_v * H), w_offset);
+
+        steel_matmul(
+            s, d,
+            h, weight_chunk, logits_view,
+            N, current_chunk_v, H,
+            1,
+            H, H,
+            false, true,
+            copies);
+
+        array d_logits_view({N, current_chunk_v}, compute_dtype, nullptr, {});
+        if (needs_separate_d_logits) {
+          d_logits_view.copy_shared_buffer(
+              d_logits_chunk, {static_cast<int64_t>(current_chunk_v), 1}, d_logits_chunk.flags(),
+              static_cast<size_t>(N * current_chunk_v), 0);
+        } else {
+          d_logits_view.copy_shared_buffer(
+              logits_chunk, {static_cast<int64_t>(current_chunk_v), 1}, logits_chunk.flags(),
+              static_cast<size_t>(N * current_chunk_v), 0);
+        }
+
+        float softcap_bwd = logit_softcap();
+        compute_encoder.set_compute_pipeline_state(d_logits_kernel);
+        compute_encoder.set_input_array(logits_view, 0);
+        compute_encoder.set_input_array(logsumexp, 1);
+        compute_encoder.set_input_array(t, 2);
+        compute_encoder.set_input_array(g_out, 3);
+        compute_encoder.set_output_array(d_logits_view, 4);
+        compute_encoder.set_bytes(N, 5);
+        compute_encoder.set_bytes(current_chunk_v, 6);
+        compute_encoder.set_bytes(v_start, 7);
+        compute_encoder.set_bytes(V, 8);
+        compute_encoder.set_bytes(scale, 9);
+        compute_encoder.set_bytes(softcap_bwd, 10);
+
+        constexpr int N_READS = 4;
+        int total_elements = N * current_chunk_v;
+        int total_threads = (total_elements + N_READS - 1) / N_READS;
+        int threads_per_tg = 256;
+        int num_tgs = (total_threads + threads_per_tg - 1) / threads_per_tg;
+        MTL::Size grid_dims = MTL::Size(num_tgs, 1, 1);
+        MTL::Size group_dims = MTL::Size(threads_per_tg, 1, 1);
+        compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
+
+        float alpha = 1.0f;
+        float beta = (chunk_idx == 0) ? 0.0f : 1.0f;
+
+        steel_matmul_axpby<true>(
+            s, d,
+            d_logits_view, weight_chunk, grad_hidden, grad_hidden,
+            N, H, current_chunk_v,
+            1,
+            current_chunk_v, H,
+            false, false,
+            copies,
+            {}, {}, {}, {},
+            alpha, beta);
+
+        array& grad_weight = outputs[1];
+        array grad_weight_chunk({current_chunk_v, H}, compute_dtype, nullptr, {});
+        int64_t gw_offset = static_cast<int64_t>(v_start) * H;
+        grad_weight_chunk.copy_shared_buffer(
+            grad_weight, {static_cast<int64_t>(H), 1}, grad_weight.flags(),
+            static_cast<size_t>(current_chunk_v * H), gw_offset);
+
+        steel_matmul(
+            s, d,
+            d_logits_view, h, grad_weight_chunk,
+            current_chunk_v, H, N,
+            1,
+            current_chunk_v, H,
+            true, false,
+            copies);
       }
-
-      float softcap_bwd = logit_softcap();
-      compute_encoder.set_compute_pipeline_state(d_logits_kernel);
-      compute_encoder.set_input_array(logits_view, 0);
-      compute_encoder.set_input_array(logsumexp, 1);
-      compute_encoder.set_input_array(t, 2);
-      compute_encoder.set_input_array(g_out, 3);
-      compute_encoder.set_output_array(d_logits_view, 4);
-      compute_encoder.set_bytes(N, 5);
-      compute_encoder.set_bytes(current_chunk_v, 6);
-      compute_encoder.set_bytes(v_start, 7);
-      compute_encoder.set_bytes(V, 8);
-      compute_encoder.set_bytes(scale, 9);
-      compute_encoder.set_bytes(softcap_bwd, 10);
-
-      constexpr int N_READS = 4;
-      int total_elements = N * current_chunk_v;
-      int total_threads = (total_elements + N_READS - 1) / N_READS;
-      dispatch_1d(compute_encoder, total_threads);
-
-      float alpha = 1.0f;
-      float beta = (chunk_idx == 0) ? 0.0f : 1.0f;
-
-      steel_matmul_axpby<true>(
-          s, d,
-          d_logits_view, weight_chunk, grad_hidden, grad_hidden,
-          N, H, current_chunk_v,
-          1,
-          current_chunk_v, H,
-          false, false,
-          copies,
-          {}, {}, {}, {},
-          alpha, beta);
-
-      array grad_weight_chunk({current_chunk_v, H}, compute_dtype, nullptr, {});
-      int64_t gw_offset = static_cast<int64_t>(v_start) * H;
-      grad_weight_chunk.copy_shared_buffer(
-          grad_weight, {static_cast<int64_t>(H), 1}, grad_weight.flags(),
-          static_cast<size_t>(current_chunk_v * H), gw_offset);
-
-      steel_matmul(
-          s, d,
-          d_logits_view, h, grad_weight_chunk,
-          current_chunk_v, H, N,
-          1,
-          current_chunk_v, H,
-          true, false,
-          copies);
     }
 
     if (logsumexp_needs_temp) {
@@ -502,6 +727,9 @@ void CCELossVJP::eval_gpu(
     d.add_temporary(logits_chunk, s.index);
     if (needs_separate_d_logits) {
       d.add_temporary(d_logits_chunk, s.index);
+    }
+    if (quantized) {
+      d.add_temporary(qmm_temp, s.index);
     }
   }
 

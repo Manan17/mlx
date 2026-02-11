@@ -6,6 +6,7 @@
 #include "mlx/backend/metal/device.h"
 #include "mlx/backend/metal/kernels.h"
 #include "mlx/backend/metal/reduce.h"
+#include "mlx/backend/metal/quantized.h"
 #include "mlx/backend/metal/unary.h"
 #include "mlx/backend/metal/utils.h"
 #include "mlx/fast_primitives.h"
@@ -171,6 +172,51 @@ inline int add_gather_strides_and_shapes(
   compute_encoder.set_vector_bytes(strides[1], offset++);
 
   return offset;
+}
+
+inline int get_qmv_batch_limit_ext(int D, int O, metal::Device& d) {
+  auto arch = d.get_architecture();
+  auto arch_size = arch.back();
+  auto arch_gen = arch.substr(arch.size() - 3, 2);
+  if (arch_gen == "13" || arch_gen == "14") {
+    switch (arch_size) {
+      case 'd':
+        if (D <= 2048 && O <= 2048) {
+          return 32;
+        } else if (D <= 4096 && O <= 4096) {
+          return 18;
+        } else {
+          return 12;
+        }
+      default:
+        if (D <= 2048 && O <= 2048) {
+          return 14;
+        } else if (D <= 4096 && O <= 4096) {
+          return 10;
+        } else {
+          return 6;
+        }
+    }
+  } else {
+    switch (arch_size) {
+      case 'd':
+        if (D <= 2048 && O <= 2048) {
+          return 32;
+        } else if (D <= 4096 && O <= 4096) {
+          return 18;
+        } else {
+          return 12;
+        }
+      default:
+        if (D <= 2048 && O <= 2048) {
+          return 18;
+        } else if (D <= 4096 && O <= 4096) {
+          return 12;
+        } else {
+          return 10;
+        }
+    }
+  }
 }
 
 } // namespace
@@ -1646,6 +1692,48 @@ void fast::ConvertFP8::eval_gpu(
   auto& in = inputs[0];
   auto& out = outputs[0];
   unary_op_gpu(inputs, out, name(), stream());
+}
+
+void dispatch_quantized_matmul(
+    const array& x,
+    const array& w,
+    const array& scales,
+    const std::optional<array>& biases,
+    array& out,
+    bool transpose,
+    int group_size,
+    int bits,
+    int M,
+    int N,
+    int K,
+    metal::Device& d,
+    const Stream& s) {
+  std::string mode = "affine";
+
+  int vector_limit = transpose ? get_qmv_batch_limit_ext(K, N, d) : 4;
+  if (M >= vector_limit) {
+    qmm(x, w, scales, biases, out, transpose, group_size, bits, M, N, K, d, s,
+         mode);
+    return;
+  }
+
+  if (transpose && (K == 128 || K == 64) && is_power_of_2(bits)) {
+    qmv_quad(x, w, scales, biases, out, group_size, bits, M, N, K, d, s, mode);
+    return;
+  }
+
+  if (transpose) {
+    qmv(x, w, scales, biases, out, group_size, bits, M, N, K, d, s, mode);
+    return;
+  }
+
+  if (K < 1024) {
+    qvm(x, w, scales, biases, out, group_size, bits, M, N, K, d, s, mode);
+    return;
+  }
+
+  qvm_split_k(x, w, scales, biases, out, group_size, bits, M, N, K, d, s,
+               mode);
 }
 
 } // namespace mlx::core

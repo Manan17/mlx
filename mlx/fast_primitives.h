@@ -362,10 +362,13 @@ class Quantize : public Custom {
 
 using ScalarArg = std::variant<bool, int, float>;
 
-// Chunked Cross-Entropy Loss Primitive
-// Computes cross-entropy in chunks to avoid materializing full logits [N, V]
-// Inputs: [hidden (N, H), weight (V, H), targets (N,)]
-// Outputs: [loss (N,)] or [loss (N,), logsumexp (N,)] if output_logsumexp
+// CCE (Cut Cross-Entropy) Primitive
+// Memory-efficient cross-entropy that tiles over vocabulary dimension.
+// - Tiles vocabulary (not tokens) for better memory efficiency
+// - Uses threadgroup memory for weight tiles
+// - Exploits softmax sparsity in backward pass (~99% compute savings)
+// - Computes grad_weight properly
+// - Saves logsumexp from forward for backward (memory optimization)
 class CCELoss : public Custom {
  public:
   CCELoss(
@@ -373,11 +376,15 @@ class CCELoss : public Custom {
       std::function<std::vector<array>(std::vector<array>)> fallback,
       int ignore_index,
       float logit_softcap = 0.0f,
-      bool output_logsumexp = false)
+      bool output_logsumexp = false,
+      int group_size = 0,
+      int bits = 0)
       : Custom(stream, std::move(fallback)),
         ignore_index_(ignore_index),
         logit_softcap_(logit_softcap),
-        output_logsumexp_(output_logsumexp) {}
+        output_logsumexp_(output_logsumexp),
+        group_size_(group_size),
+        bits_(bits) {}
 
   // Use CCE kernel on GPU, fallback on CPU
   static bool use_fallback(Stream s) { return s.device == Device::cpu; }
@@ -406,20 +413,25 @@ class CCELoss : public Custom {
   DEFINE_INPUT_OUTPUT_SHAPE()
 
   auto state() const {
-    return std::make_tuple(nullptr, ignore_index_, logit_softcap_, output_logsumexp_);
+    return std::make_tuple(nullptr, ignore_index_, logit_softcap_, output_logsumexp_, group_size_, bits_);
   }
 
   int ignore_index() const { return ignore_index_; }
   float logit_softcap() const { return logit_softcap_; }
   bool output_logsumexp() const { return output_logsumexp_; }
+  int group_size() const { return group_size_; }
+  int bits() const { return bits_; }
 
  private:
   int ignore_index_;
   float logit_softcap_;
   bool output_logsumexp_;
+  int group_size_;
+  int bits_;
 };
 
 // CCE VJP (backward pass) Primitive
+// Uses sparse backward computation - skips vocabulary tiles with negligible gradients
 // Inputs: [hidden, weight, targets, grad_output, logsumexp] (logsumexp saved from forward)
 class CCELossVJP : public Custom {
  public:
@@ -428,11 +440,15 @@ class CCELossVJP : public Custom {
       std::function<std::vector<array>(std::vector<array>)> fallback,
       int ignore_index,
       float logit_softcap = 0.0f,
-      bool has_logsumexp = false)
+      bool has_logsumexp = false,
+      int group_size = 0,
+      int bits = 0)
       : Custom(stream, std::move(fallback)),
         ignore_index_(ignore_index),
         logit_softcap_(logit_softcap),
-        has_logsumexp_(has_logsumexp) {}
+        has_logsumexp_(has_logsumexp),
+        group_size_(group_size),
+        bits_(bits) {}
 
   // CPU uses fallback
   void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs)
@@ -450,16 +466,20 @@ class CCELossVJP : public Custom {
   DEFINE_NAME(CCELossVJP)
   bool is_equivalent(const Primitive& other) const override;
   auto state() const {
-    return std::make_tuple(nullptr, ignore_index_, logit_softcap_, has_logsumexp_);
+    return std::make_tuple(nullptr, ignore_index_, logit_softcap_, has_logsumexp_, group_size_, bits_);
   }
 
   float logit_softcap() const { return logit_softcap_; }
   bool has_logsumexp() const { return has_logsumexp_; }
+  int group_size() const { return group_size_; }
+  int bits() const { return bits_; }
 
  private:
   int ignore_index_;
   float logit_softcap_;
   bool has_logsumexp_;
+  int group_size_;
+  int bits_;
 };
 
 class CustomKernel : public Primitive {
