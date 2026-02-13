@@ -19,6 +19,7 @@
       constant int& V [[buffer(8)]],                                              \
       constant float& scale [[buffer(9)]],                                        \
       constant float& softcap [[buffer(10)]],                                     \
+      constant int& ignore_index [[buffer(11)]],                                  \
       uint tid [[thread_position_in_grid]]);
 
 #define instantiate_cce_chunk_logsumexp(name, type)                              \

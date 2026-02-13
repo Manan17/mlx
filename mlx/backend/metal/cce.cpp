@@ -355,6 +355,15 @@ void CCELossVJP::eval_gpu(
   array& grad_hidden = outputs[0];
   grad_hidden.set_data(allocator::malloc(grad_hidden.nbytes()));
 
+  // Zero-initialize grad_hidden — steel_matmul_axpby with beta=0 still
+  // reads C, so 0.0 * NaN = NaN if the buffer pool recycles a buffer
+  // containing NaN from earlier operations.
+  {
+    array zero_val_gh = array(0.0f, compute_dtype);
+    fill_gpu(zero_val_gh, grad_hidden, s);
+    copies.push_back(std::move(zero_val_gh));
+  }
+
   if (!quantized) {
     array& grad_weight = outputs[1];
     grad_weight.set_data(allocator::malloc(grad_weight.nbytes()));
@@ -610,6 +619,7 @@ void CCELossVJP::eval_gpu(
         compute_encoder.set_bytes(V, 8);
         compute_encoder.set_bytes(scale, 9);
         compute_encoder.set_bytes(softcap_bwd, 10);
+        compute_encoder.set_bytes(ignore_index_, 11);
 
         constexpr int N_READS = 4;
         int total_elements = N * current_chunk_v;
@@ -679,6 +689,7 @@ void CCELossVJP::eval_gpu(
         compute_encoder.set_bytes(V, 8);
         compute_encoder.set_bytes(scale, 9);
         compute_encoder.set_bytes(softcap_bwd, 10);
+        compute_encoder.set_bytes(ignore_index_, 11);
 
         constexpr int N_READS = 4;
         int total_elements = N * current_chunk_v;

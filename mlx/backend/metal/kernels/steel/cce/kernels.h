@@ -48,6 +48,7 @@ template <typename T, int N_READS = 4>
     constant int& V [[buffer(8)]],
     constant float& scale [[buffer(9)]],
     constant float& softcap [[buffer(10)]],
+    constant int& ignore_index [[buffer(11)]],
     uint tid [[thread_position_in_grid]]) {
 
   const int base_idx = tid * N_READS;
@@ -72,8 +73,15 @@ template <typename T, int N_READS = 4>
       continue;
     }
 
-    const float token_lse = lse[row];
     const int target = targets[row];
+
+    // Zero gradient for ignored tokens
+    if (target == ignore_index) {
+      d_logits[idx] = T(0.0f);
+      continue;
+    }
+
+    const float token_lse = lse[row];
     const float grad_scale = grad_output[row] * scale;
 
     float raw_logit = float(logits[idx]);
